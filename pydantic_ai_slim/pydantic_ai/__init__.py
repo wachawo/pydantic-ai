@@ -125,7 +125,7 @@ from .profiles import (
 )
 from .result import AgentEventStream
 from .run import AgentRun, AgentRunResult, AgentRunResultEvent
-from .settings import ModelSettings
+from .settings import ModelSettings, ToolChoice, ToolOrOutput
 from .tools import (
     AgentBuiltinTool,
     DeferredToolRequests,
@@ -313,6 +313,8 @@ __all__ = (
     'ModelRequestContext',
     # settings
     'ModelSettings',
+    'ToolChoice',
+    'ToolOrOutput',
     # usage
     'RunUsage',
     'RequestUsage',
