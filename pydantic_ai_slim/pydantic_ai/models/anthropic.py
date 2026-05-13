@@ -100,6 +100,7 @@ try:
         APIConnectionError,
         APIStatusError,
         AsyncAnthropicBedrock,
+        AsyncAnthropicBedrockMantle,
         AsyncAnthropicFoundry,
         AsyncAnthropicVertex,
         AsyncStream,
@@ -216,8 +217,22 @@ except ImportError as _import_error:
         'you can use the `anthropic` optional group — `pip install "pydantic-ai-slim[anthropic]"`'
     ) from _import_error
 
+# `AsyncAnthropicBedrockMantle` uses the Messages API and supports automatic prompt caching (unlike the
+# legacy `AsyncAnthropicBedrock` InvokeModel API), so it's not in `_NON_AUTOMATIC_CACHING_CLIENTS`. Fast
+# mode is not available on any Bedrock transport, so it goes in `_FAST_MODE_UNSUPPORTED_CLIENTS`.
 _NON_AUTOMATIC_CACHING_CLIENTS = (AsyncAnthropicBedrock, AsyncAnthropicVertex)
-_FAST_MODE_UNSUPPORTED_CLIENTS = (AsyncAnthropicBedrock, AsyncAnthropicFoundry, AsyncAnthropicVertex)
+_FAST_MODE_UNSUPPORTED_CLIENTS = (
+    AsyncAnthropicBedrock,
+    AsyncAnthropicBedrockMantle,
+    AsyncAnthropicFoundry,
+    AsyncAnthropicVertex,
+)
+# The legacy Bedrock InvokeModel API (`AsyncAnthropicBedrock`) doesn't support the `bm25` tool-search
+# variant — it 400s with `BM25 tool search is not supported on Bedrock. Use tool_search_tool_regex instead.`
+# — so we default to `regex` there. The other transports (Vertex, Foundry, and the Messages-API-based
+# `AsyncAnthropicBedrockMantle`) expose the full Messages API, including both tool-search variants, so they
+# keep the `bm25` default.
+_BM25_TOOL_SEARCH_UNSUPPORTED_CLIENTS = (AsyncAnthropicBedrock,)
 
 _ANTHROPIC_SAMPLING_PARAMS = ('temperature', 'top_p', 'top_k')
 _ANTHROPIC_TASK_BUDGETS_BETA = 'task-budgets-2026-03-13'
@@ -975,6 +990,21 @@ class AnthropicModel(Model[AsyncAnthropicClient]):
             )
         return version
 
+    def _resolve_tool_search_strategy(self, strategy: Literal['bm25', 'regex'] | None) -> Literal['bm25', 'regex']:
+        """Resolve which native tool-search variant to send.
+
+        `bm25` is the default, except on clients that don't support it (the legacy Bedrock
+        InvokeModel API), where `regex` is the default and an explicit `bm25` is rejected.
+        """
+        if isinstance(self.client, _BM25_TOOL_SEARCH_UNSUPPORTED_CLIENTS):
+            if strategy == 'bm25':
+                raise UserError(
+                    "ToolSearch(strategy='bm25') is not supported by the `AsyncAnthropicBedrock` client; "
+                    "use ToolSearch(strategy='regex') instead, or leave the strategy unset to use the default."
+                )
+            return 'regex'
+        return strategy or 'bm25'
+
     def _add_native_tools(
         self,
         tools: list[BetaToolUnionParam],
@@ -1025,23 +1055,21 @@ class AnthropicModel(Model[AsyncAnthropicClient]):
             elif isinstance(tool, ToolSearchTool):  # pragma: no branch
                 # Custom-callable strategies go through the regular `search_tools` function tool
                 # (which is already in `function_tools`), so no server-side builtin is emitted.
-                if tool.strategy == 'custom':
-                    pass
-                # Default strategy is BM25; regex is the alternative named strategy.
-                elif tool.strategy == 'regex':
-                    tools.append(
-                        BetaToolSearchToolRegex20251119Param(
-                            type='tool_search_tool_regex_20251119',
-                            name='tool_search_tool_regex',
+                if tool.strategy != 'custom':
+                    if self._resolve_tool_search_strategy(tool.strategy) == 'regex':
+                        tools.append(
+                            BetaToolSearchToolRegex20251119Param(
+                                type='tool_search_tool_regex_20251119',
+                                name='tool_search_tool_regex',
+                            )
                         )
-                    )
-                else:
-                    tools.append(
-                        BetaToolSearchToolBm25_20251119Param(
-                            type='tool_search_tool_bm25_20251119',
-                            name='tool_search_tool_bm25',
+                    else:
+                        tools.append(
+                            BetaToolSearchToolBm25_20251119Param(
+                                type='tool_search_tool_bm25_20251119',
+                                name='tool_search_tool_bm25',
+                            )
                         )
-                    )
                 # No `beta_features.add(...)`: tool search is GA on Sonnet/Opus/Haiku 4.5+ and the
                 # provisional `tool-search-tool-2025-11-19` beta header is rejected by the API.
             elif isinstance(tool, MCPServerTool) and tool.url:
@@ -1350,10 +1378,14 @@ class AnthropicModel(Model[AsyncAnthropicClient]):
                                     continue
                                 # Round-trip the native variant (bm25/regex) so we don't
                                 # silently rewrite the algorithm. `_map_server_tool_use_block`
-                                # stashes it in `provider_details['strategy']`.
+                                # stashes it in `provider_details['strategy']`. Clients that don't
+                                # support `bm25` (legacy Bedrock InvokeModel) always replay as `regex`.
                                 details = response_part.provider_details or {}
                                 strategy: Literal['bm25', 'regex'] = (
-                                    'regex' if details.get('strategy') == 'regex' else 'bm25'
+                                    'regex'
+                                    if details.get('strategy') == 'regex'
+                                    or isinstance(self.client, _BM25_TOOL_SEARCH_UNSUPPORTED_CLIENTS)
+                                    else 'bm25'
                                 )
                                 native_name = (
                                     'tool_search_tool_regex' if strategy == 'regex' else 'tool_search_tool_bm25'
