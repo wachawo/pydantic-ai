@@ -28,6 +28,7 @@ from pydantic_ai.capabilities import (
     HandleDeferredToolCalls,
     ImageGeneration,
     IncludeToolReturnSchemas,
+    Instrumentation,
     NativeTool,
     PrefixTools,
     ProcessEventStream,
@@ -41,6 +42,7 @@ from pydantic_ai.capabilities import (
     WebSearch,
     WrapperCapability,
 )
+from pydantic_ai.capabilities._ordering import has_capability_type
 from pydantic_ai.capabilities.abstract import AbstractCapability
 from pydantic_ai.capabilities.combined import CombinedCapability
 from pydantic_ai.capabilities.hooks import Hooks, HookTimeoutError
@@ -109,6 +111,7 @@ def test_capability_types() -> None:
             'NativeTool': NativeTool,
             'ImageGeneration': ImageGeneration,
             'IncludeToolReturnSchemas': IncludeToolReturnSchemas,
+            'Instrumentation': Instrumentation,
             'MCP': MCP,
             'PrefixTools': PrefixTools,
             'ReinjectSystemPrompt': ReinjectSystemPrompt,
@@ -465,9 +468,49 @@ def test_agent_from_spec_tool_timeout_override():
     assert agent._tool_timeout == 5.0  # pyright: ignore[reportPrivateUsage]
 
 
+def _has_instrumentation_capability(agent: Agent[Any, Any]) -> bool:
+    return has_capability_type([agent._root_capability], Instrumentation)  # pyright: ignore[reportPrivateUsage]
+
+
 def test_agent_from_spec_instrument():
-    agent = Agent.from_spec({'model': 'test', 'instrument': True})
-    assert agent.instrument is True
+    """The deprecated spec `instrument` field bridges to an `Instrumentation` capability."""
+    with pytest.warns(PydanticAIDeprecationWarning, match=r'`AgentSpec\.instrument` is deprecated'):
+        agent = Agent.from_spec({'model': 'test', 'instrument': True})
+    assert _has_instrumentation_capability(agent)
+
+
+def test_agent_from_spec_instrument_kwarg_deprecated():
+    """The `instrument=` kwarg on `from_spec` is deprecated; the agent still gets configured."""
+    with pytest.warns(PydanticAIDeprecationWarning, match=r'`Agent\.from_spec\(instrument=\.\.\.\)` is deprecated'):
+        agent = Agent.from_spec({'model': 'test'}, instrument=True)  # type: ignore[call-arg]
+    assert _has_instrumentation_capability(agent)  # pyright: ignore[reportUnknownArgumentType]
+
+
+def test_agent_from_file_instrument_kwarg_deprecated(tmp_path: Path):
+    """The `instrument=` kwarg on `from_file` is deprecated; the agent still gets configured."""
+    spec_path = tmp_path / 'spec.yaml'
+    spec_path.write_text('model: test\n')
+    with pytest.warns(PydanticAIDeprecationWarning, match=r'`Agent\.from_file\(instrument=\.\.\.\)` is deprecated'):
+        agent = Agent.from_file(spec_path, instrument=True)  # type: ignore[call-arg]
+    assert _has_instrumentation_capability(agent)  # pyright: ignore[reportUnknownArgumentType]
+
+
+def test_agent_init_instrument_kwarg_deprecated():
+    """The `instrument=` kwarg on `Agent(...)` is deprecated; the agent still gets configured."""
+    with pytest.warns(PydanticAIDeprecationWarning, match=r'`Agent\(instrument=\.\.\.\)` is deprecated'):
+        agent = Agent(model='test', instrument=True)  # type: ignore[call-arg]
+    assert _has_instrumentation_capability(agent)
+
+
+def test_agent_instrument_reader_deprecated():
+    """Reading/writing `agent.instrument` is deprecated."""
+    agent = Agent(model='test')
+    with pytest.warns(PydanticAIDeprecationWarning, match=r'`Agent\.instrument` is deprecated'):
+        _ = agent.instrument
+    with pytest.warns(PydanticAIDeprecationWarning, match=r'`Agent\.instrument` is deprecated'):
+        agent.instrument = True
+    with pytest.warns(PydanticAIDeprecationWarning, match=r'`Agent\.instrument` is deprecated'):
+        assert agent.instrument is True
 
 
 def test_agent_from_spec_metadata():
@@ -1515,6 +1558,7 @@ Supported by:
                                 {'$ref': '#/$defs/spec_ImageGeneration'},
                                 {'const': 'IncludeToolReturnSchemas', 'type': 'string'},
                                 {'$ref': '#/$defs/short_spec_IncludeToolReturnSchemas'},
+                                {'const': 'Instrumentation', 'type': 'string'},
                                 {'$ref': '#/$defs/short_spec_MCP'},
                                 {'$ref': '#/$defs/spec_MCP'},
                                 {'$ref': '#/$defs/spec_PrefixTools'},
@@ -1692,6 +1736,7 @@ Supported by:
                             {'$ref': '#/$defs/spec_ImageGeneration'},
                             {'const': 'IncludeToolReturnSchemas', 'type': 'string'},
                             {'$ref': '#/$defs/short_spec_IncludeToolReturnSchemas'},
+                            {'const': 'Instrumentation', 'type': 'string'},
                             {'$ref': '#/$defs/short_spec_MCP'},
                             {'$ref': '#/$defs/spec_MCP'},
                             {'$ref': '#/$defs/spec_PrefixTools'},
@@ -10377,37 +10422,34 @@ def test_ordering_preserves_user_order():
 
 
 def test_ordering_nested_combined():
-    """Ordering from leaves inside a nested CombinedCapability is respected.
+    """Leaves of a nested `CombinedCapability` participate as siblings in the outer sort.
 
-    When a CombinedCapability is nested inside another, its leaves' ordering
-    constraints are merged and applied to the outer sort. Leaves without
-    ordering constraints are skipped during the merge.
+    `CombinedCapability` auto-flattens nested instances so each leaf is sorted
+    independently rather than as a group. Here `OutermostCap` (inside `inner`)
+    sorts to the front; its former sibling `PlainCapB` is unconstrained.
     """
-    # OutermostCap declares position='outermost'; PlainCapB has no ordering.
-    # The merged effective ordering for 'inner' should be position='outermost',
-    # placing it before PlainCapA despite being listed second.
     inner = CombinedCapability([PlainCapB(), OutermostCap()])
     combined = CombinedCapability([PlainCapA(), inner])
-    assert combined.capabilities[0] is inner
+    # `inner` is splatted; `OutermostCap` sorts first.
+    assert [type(c) for c in combined.capabilities] == [OutermostCap, PlainCapA, PlainCapB]
 
 
 def test_ordering_nested_combined_no_constraints():
-    """A nested CombinedCapability with no ordering leaves is treated as unconstrained."""
+    """A nested `CombinedCapability` with no ordering leaves is splatted as flat siblings."""
     inner = CombinedCapability([PlainCapA(), PlainCapB()])
     combined = CombinedCapability([inner, OutermostCap()])
-    # OutermostCap first (has ordering), inner second (no constraints → unconstrained)
-    assert combined.capabilities[0].__class__ is OutermostCap
-    assert combined.capabilities[1] is inner
+    # `OutermostCap` first; `inner`'s leaves follow as flat siblings in their original order.
+    assert [type(c) for c in combined.capabilities] == [OutermostCap, PlainCapA, PlainCapB]
 
 
 def test_ordering_nested_combined_wraps_without_position():
-    """A nested CombinedCapability with wraps constraints (but no position) merges correctly."""
+    """A `wraps` constraint on a leaf inside a nested `CombinedCapability` applies to that leaf only."""
     inner = CombinedCapability([PlainCapB(), WrapsACap()])
-    # WrapsACap has wraps=[PlainCapA] but no position.
-    # The nested group inherits that constraint, so it sorts before PlainCapA.
     combined = CombinedCapability([PlainCapA(), inner])
-    assert combined.capabilities[0] is inner
-    assert combined.capabilities[1].__class__ is PlainCapA
+    # `WrapsACap` is splatted and sorts before `PlainCapA`; `PlainCapB` is unconstrained
+    # and keeps its insertion order (it sits between PlainCapA and WrapsACap in the
+    # post-flatten input list, so the topo sort surfaces it first as ready-without-deps).
+    assert [type(c) for c in combined.capabilities] == [PlainCapB, WrapsACap, PlainCapA]
 
 
 def test_ordering_single_capability():
@@ -10439,11 +10481,12 @@ def test_ordering_cycle_detection():
         CombinedCapability([CycleA(), CycleB()])
 
 
-def test_ordering_conflicting_positions_in_nested():
-    """Conflicting positions in a nested CombinedCapability raise UserError."""
+def test_ordering_mixed_positions_in_nested():
+    """Mixed positions in a nested `CombinedCapability` work — leaves are splatted into the outer sort."""
     inner = CombinedCapability([OutermostCap(), InnermostCap()])
-    with pytest.raises(UserError, match='Conflicting positions in nested CombinedCapability'):
-        CombinedCapability([inner, PlainCapA()])
+    combined = CombinedCapability([inner, PlainCapA()])
+    # `OutermostCap` first (outermost tier), `PlainCapA` middle, `InnermostCap` last (innermost tier).
+    assert [type(c) for c in combined.capabilities] == [OutermostCap, PlainCapA, InnermostCap]
 
 
 def test_ordering_wrapper_capability_recurses():
@@ -10453,6 +10496,19 @@ def test_ordering_wrapper_capability_recurses():
     # and picks up OutermostCap's position='outermost' constraint.
     combined = CombinedCapability([PlainCapA(), wrapped])
     assert combined.capabilities[0] is wrapped
+
+
+def test_ordering_wrapper_capability_around_conflicting_positions_raises():
+    """A `WrapperCapability` wrapping a `CombinedCapability` whose leaves span both
+    `outermost` and `innermost` tiers can't be assigned a single effective position —
+    `_effective_ordering` raises `UserError`. (Direct nesting of `CombinedCapability`
+    is auto-flattened so this case only fires through a non-`CombinedCapability`
+    container like `WrapperCapability`.)
+    """
+    inner = CombinedCapability([OutermostCap(), InnermostCap()])
+    wrapped = WrapperCapability(wrapped=inner)
+    with pytest.raises(UserError, match='Conflicting positions'):
+        CombinedCapability([wrapped, PlainCapA()])
 
 
 def test_ordering_hooks_ordering_parameter():

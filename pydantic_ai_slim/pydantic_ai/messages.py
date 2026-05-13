@@ -24,6 +24,7 @@ from pydantic.dataclasses import dataclass as pydantic_dataclass
 from typing_extensions import TypeAliasType, TypeVar, deprecated
 
 from . import _otel_messages, _utils
+from ._instrumentation import serialize_any
 from ._utils import generate_tool_call_id as _generate_tool_call_id, now_utc as _now_utc
 from ._warnings import PydanticAIDeprecationWarning
 from .exceptions import UnexpectedModelBehavior
@@ -1280,8 +1281,6 @@ class BaseToolReturnPart:
         )
 
     def otel_message_parts(self, settings: InstrumentationSettings) -> list[_otel_messages.MessagePart]:
-        from .models.instrumented import InstrumentedModel
-
         part = _otel_messages.ToolCallResponsePart(
             type='tool_call_response',
             id=self.tool_call_id,
@@ -1289,7 +1288,7 @@ class BaseToolReturnPart:
         )
 
         if settings.include_content and self.content is not None:
-            part['result'] = InstrumentedModel.serialize_any(self.content)
+            part['result'] = serialize_any(self.content)
 
         return [part]
 
@@ -2263,8 +2262,6 @@ class ModelResponse:
         return result
 
     def otel_message_parts(self, settings: InstrumentationSettings) -> list[_otel_messages.MessagePart]:
-        from .models.instrumented import InstrumentedModel
-
         parts: list[_otel_messages.MessagePart] = []
         for part in self.parts:
             if isinstance(part, TextPart):
@@ -2298,7 +2295,7 @@ class ModelResponse:
                     if isinstance(part.args, str):
                         call_part['arguments'] = part.args
                     else:
-                        call_part['arguments'] = {k: InstrumentedModel.serialize_any(v) for k, v in part.args.items()}
+                        call_part['arguments'] = {k: serialize_any(v) for k, v in part.args.items()}
 
                 parts.append(call_part)
             elif isinstance(part, NativeToolReturnPart):
@@ -2309,7 +2306,7 @@ class ModelResponse:
                     builtin=True,
                 )
                 if settings.include_content and part.content is not None:  # pragma: no branch
-                    return_part['result'] = InstrumentedModel.serialize_any(part.content)
+                    return_part['result'] = serialize_any(part.content)
 
                 parts.append(return_part)
             elif isinstance(part, CompactionPart):
